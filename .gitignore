@@ -1,0 +1,54 @@
+# =========================
+# ENV files (root / web / api)
+# =========================
+.env
+.env.*
+!/\.env\.example
+!/web/.env.example
+!/api/.env.example
+
+web/.env
+web/.env.local
+web/.env.*
+api/.env
+api/.env.*
+
+# =========================
+# Node / Next.js / build outputs
+# =========================
+**/node_modules/
+**/.next/
+**/out/
+**/dist/
+**/build/
+**/.turbo/
+**/.cache/
+
+# Logs
+**/npm-debug.log*
+**/yarn-debug.log*
+**/yarn-error.log*
+**/pnpm-debug.log*
+**/*.log
+
+# =========================
+# SQLite DB + runtime data (api)
+# =========================
+api/data/*.db
+api/data/*.db-wal
+api/data/*.db-shm
+api/data/*.sqlite
+api/data/*.sqlite3
+
+# If you want to keep empty data folder tracked:
+!api/data/.gitkeep
+
+# =========================
+# OS / editor junk
+# =========================
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.swp
+*~

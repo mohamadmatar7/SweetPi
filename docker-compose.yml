@@ -1,0 +1,83 @@
+services:
+  sweetpi-core:
+    build:
+      context: ./api
+      dockerfile: Dockerfile.dev
+    container_name: sweetpi-core
+    working_dir: /usr/src/app
+    restart: unless-stopped
+    privileged: true
+    environment:
+      - PORT=4000
+      - SOKETI_APP_ID=${PUSHER_APP_ID}
+      - SOKETI_APP_KEY=${PUSHER_APP_KEY}
+      - SOKETI_APP_SECRET=${PUSHER_APP_SECRET}
+      - MOLLIE_API_KEY=${MOLLIE_API_KEY}
+      - PUBLIC_WEB_URL=${PUBLIC_WEB_URL}
+      - PUBLIC_API_URL=${PUBLIC_API_URL}
+    volumes:
+      - ./api:/usr/src/app
+      - sweetpi_core_node_modules:/usr/src/app/node_modules
+      - ./api/data:/usr/src/app/data
+    command: npm run dev
+    ports:
+      - "4000:4000"
+    depends_on:
+      - sweetpi-soketi
+
+  sweetpi-soketi:
+    image: quay.io/soketi/soketi:1.6-16-alpine
+    container_name: sweetpi-soketi
+    restart: unless-stopped
+    environment:
+      - SOKETI_DEBUG=1
+      - SOKETI_DEFAULT_APP_ID=${PUSHER_APP_ID}
+      - SOKETI_DEFAULT_APP_KEY=${PUSHER_APP_KEY}
+      - SOKETI_DEFAULT_APP_SECRET=${PUSHER_APP_SECRET}
+    expose:
+      - "6001"
+      - "9601"
+
+  sweetpi-web:
+    image: node:20-alpine
+    container_name: sweetpi-web
+    working_dir: /app
+    restart: unless-stopped
+    depends_on:
+      - sweetpi-core
+      - sweetpi-soketi
+    environment:
+      - NODE_ENV=development
+      - CHOKIDAR_USEPOLLING=true
+      - WATCHPACK_POLLING=true
+
+      # public envs
+      - NEXT_PUBLIC_API_BASE_URL=${NEXT_PUBLIC_API_BASE_URL}
+      - NEXT_PUBLIC_SOKETI_KEY=${NEXT_PUBLIC_SOKETI_KEY}
+      - NEXT_PUBLIC_SOKETI_WS_HOST=${NEXT_PUBLIC_SOKETI_WS_HOST}
+      - NEXT_PUBLIC_SOKETI_FORCE_TLS=${NEXT_PUBLIC_SOKETI_FORCE_TLS}
+      - NEXT_PUBLIC_SOKETI_WS_PORT=${NEXT_PUBLIC_SOKETI_WS_PORT}
+
+    volumes:
+      - ./web:/app
+      - sweetpi_web_node_modules:/app/node_modules
+    command: sh -c "npm install && npm run dev"
+    ports:
+      - "3000:3000"
+
+
+  sweetpi-cloudflared:
+    image: cloudflare/cloudflared:latest
+    container_name: sweetpi-cloudflared
+    restart: unless-stopped
+    environment:
+      - TUNNEL_TOKEN=${CLOUDFLARE_TUNNEL_TOKEN}
+    command: tunnel --no-autoupdate run
+    depends_on:
+      - sweetpi-web
+      - sweetpi-core
+      - sweetpi-soketi
+
+volumes:
+  sweetpi_core_node_modules:
+  sweetpi_web_node_modules:
