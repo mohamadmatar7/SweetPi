@@ -3,7 +3,7 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
 import { useRouter } from 'next/navigation';
 import Pusher from 'pusher-js';
-import Controls from '../components/Controls';
+import Controls from './../components/Controls';
 
 const API_BASE_URL = process.env.NEXT_PUBLIC_API_BASE_URL;
 
@@ -25,32 +25,27 @@ export default function ArcadePage() {
     const [activeDonationId, setActiveDonationId] = useState(null);
     const [firstMoveDeadline, setFirstMoveDeadline] = useState(null);
 
-    // Notice banner for the user (re-queued, etc.)
-    const [notice, setNotice] = useState(null); // { type: 'error'|'info', text: string }
+    const [notice, setNotice] = useState(null);
 
-    // Credit timer synced to server creditEndsAt (survives refresh)
     const [secondsLeft, setSecondsLeft] = useState(CREDIT_SECONDS);
     const [timerRunning, setTimerRunning] = useState(false);
     const timerRef = useRef(null);
     const endsAtRef = useRef(null);
 
-    // First-move countdown (15s) shown while waiting for the first move of a credit
     const [firstMoveSecondsLeft, setFirstMoveSecondsLeft] = useState(null);
     const firstMoveIntervalRef = useRef(null);
 
-    // Detect credits drop to reset UI between credits
     const prevCreditsRef = useRef(null);
-
-    // Auto-dismiss notice
     const noticeTimerRef = useRef(null);
 
-    // Keep latest me.id in a ref to avoid stale closures in socket handlers
+    // Sequence increments whenever a new credit starts (used to reset Controls state)
+    const [creditSeq, setCreditSeq] = useState(0);
+
     const meIdRef = useRef(null);
     useEffect(() => {
         meIdRef.current = me?.id ?? null;
     }, [me?.id]);
 
-    // Read token on mount
     useEffect(() => {
         const t = localStorage.getItem(TOKEN_KEY);
         if (!t) {
@@ -60,14 +55,10 @@ export default function ArcadePage() {
         setToken(t);
     }, [router]);
 
-    /**
-     * Start (or re-sync) the 35s credit timer from server deadline.
-     */
     function startTimerWithEndsAt(endsAt) {
         if (!endsAt) return;
 
         endsAtRef.current = endsAt;
-
         if (timerRef.current) clearInterval(timerRef.current);
 
         setTimerRunning(true);
@@ -78,7 +69,6 @@ export default function ArcadePage() {
             if (left <= 0) stopTimer();
         }, 1000);
 
-        // Update instantly
         const leftNow = Math.max(0, Math.ceil((endsAt - Date.now()) / 1000));
         setSecondsLeft(leftNow);
     }
@@ -96,21 +86,11 @@ export default function ArcadePage() {
         noticeTimerRef.current = setTimeout(() => setNotice(null), ms);
     }
 
-    /**
-     * Am I currently the active player?
-     */
     const isActive = useMemo(() => {
         return me && me.status === 'active' && activeDonationId === me.id;
     }, [me, activeDonationId]);
 
-    /**
-     * Maintain a live 15s countdown while:
-     * - I'm active
-     * - credit timer has NOT started yet
-     * - a firstMoveDeadline exists
-     */
     useEffect(() => {
-        // Clear any existing interval
         if (firstMoveIntervalRef.current) {
             clearInterval(firstMoveIntervalRef.current);
             firstMoveIntervalRef.current = null;
@@ -122,10 +102,7 @@ export default function ArcadePage() {
         }
 
         const update = () => {
-            const left = Math.max(
-                0,
-                Math.ceil((firstMoveDeadline - Date.now()) / 1000)
-            );
+            const left = Math.max(0, Math.ceil((firstMoveDeadline - Date.now()) / 1000));
             setFirstMoveSecondsLeft(left);
         };
 
@@ -140,9 +117,6 @@ export default function ArcadePage() {
         };
     }, [isActive, timerRunning, firstMoveDeadline]);
 
-    /**
-     * Load initial state + connect realtime sockets.
-     */
     useEffect(() => {
         if (!token) return;
 
@@ -150,7 +124,6 @@ export default function ArcadePage() {
         let channel;
 
         async function loadInitial() {
-            // Get current player by token
             const meRes = await fetch(`${API_BASE_URL}/api/me?token=${token}`);
             if (!meRes.ok) {
                 localStorage.removeItem(TOKEN_KEY);
@@ -162,7 +135,6 @@ export default function ArcadePage() {
             setMe(meData);
             prevCreditsRef.current = meData.creditsRemaining;
 
-            // Get queue + active state for refresh sync
             const qRes = await fetch(`${API_BASE_URL}/api/queue`);
             const qData = await qRes.json();
 
@@ -170,24 +142,25 @@ export default function ArcadePage() {
             setActiveDonationId(qData.activeDonationId || null);
             setFirstMoveDeadline(qData.firstMoveDeadline || null);
 
-            // If I'm active and credit already started, re-sync timer on refresh
             if (meData.status === 'active' && qData.activeDonationId === meData.id) {
                 if (qData.creditEndsAt) {
                     startTimerWithEndsAt(qData.creditEndsAt);
+                } else {
+                    // Active but no credit running yet => new credit cycle
+                    setCreditSeq(s => s + 1);
                 }
             }
         }
 
         loadInitial();
 
-        // Setup Pusher client for Soketi
         pusher = new Pusher(SOKETI_KEY, {
             wsHost: WS_HOST,
             wsPort: WS_PORT,
             wssPort: WS_PORT,
             forceTLS: FORCE_TLS,
             enabledTransports: ['ws', 'wss'],
-            cluster: 'mt1', // dummy cluster required by pusher-js
+            cluster: 'mt1',
         });
 
         channel = pusher.subscribe('public-chat');
@@ -197,7 +170,6 @@ export default function ArcadePage() {
             setActiveDonationId(payload.activeDonationId || null);
             setFirstMoveDeadline(payload.firstMoveDeadline || null);
 
-            // Sync my status/credits from queue
             setMe((prev) => {
                 if (!prev) return prev;
                 const mine = (payload.queue || []).find(x => x.id === prev.id);
@@ -209,7 +181,7 @@ export default function ArcadePage() {
                     creditsRemaining: mine.creditsRemaining,
                 };
 
-                // If credits dropped while active => reset UI for next credit
+                // Credit consumed => new credit is ready
                 if (
                     updated.status === 'active' &&
                     prevCreditsRef.current !== null &&
@@ -217,6 +189,7 @@ export default function ArcadePage() {
                 ) {
                     setSecondsLeft(CREDIT_SECONDS);
                     stopTimer();
+                    setCreditSeq(s => s + 1); // reset Controls per credit
                 }
 
                 prevCreditsRef.current = mine.creditsRemaining;
@@ -228,20 +201,19 @@ export default function ArcadePage() {
             setActiveDonationId(payload.donationId);
             setFirstMoveDeadline(payload.firstMoveDeadline || null);
 
-            // If I'm starting, reset UI + clear any notice
             setMe((prev) => {
                 if (!prev) return prev;
                 if (payload.donationId === prev.id) {
                     setSecondsLeft(CREDIT_SECONDS);
                     stopTimer();
                     setNotice(null);
+                    setCreditSeq(s => s + 1); // new credit cycle on turn start
                 }
                 return prev;
             });
         });
 
         channel.bind('credit-start', (payload) => {
-            // Server is the source of truth for credit timers
             if (payload.donationId === meIdRef.current) {
                 startTimerWithEndsAt(payload.creditEndsAt);
             }
@@ -298,7 +270,6 @@ export default function ArcadePage() {
 
     return (
         <main className="min-h-screen bg-slate-900 text-slate-100 px-4 py-6">
-            {/* Notice banner */}
             {notice && (
                 <div
                     className={`max-w-5xl mx-auto mb-4 p-3 rounded-xl text-sm font-semibold
@@ -319,7 +290,6 @@ export default function ArcadePage() {
             </header>
 
             <div className="max-w-5xl mx-auto grid md:grid-cols-2 gap-6">
-                {/* Left: Queue */}
                 <section className="bg-slate-800 rounded-2xl p-5">
                     <h2 className="text-lg font-bold mb-3">Queue</h2>
 
@@ -361,7 +331,6 @@ export default function ArcadePage() {
                     )}
                 </section>
 
-                {/* Right: Controls / Status */}
                 <section className="bg-slate-800 rounded-2xl p-5 flex flex-col items-center justify-center gap-4">
                     {!isActive && (
                         <>
@@ -402,12 +371,9 @@ export default function ArcadePage() {
 
                             <Controls
                                 token={token}
+                                creditSeq={creditSeq}
                                 onFirstAction={() => {
-                                    /**
-                                     * Optimistic local UX start.
-                                     * Server will send "credit-start" with exact deadline anyway.
-                                     * This makes UI feel instant.
-                                     */
+                                    // Optimistic local UX start (server will resync anyway)
                                     if (!timerRunning && !endsAtRef.current) {
                                         startTimerWithEndsAt(Date.now() + CREDIT_SECONDS * 1000);
                                     }
