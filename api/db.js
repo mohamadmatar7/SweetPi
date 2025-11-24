@@ -119,15 +119,17 @@ function getDonationByPaymentId(molliePaymentId) {
 }
 
 function markIntentPaid({ intentId, molliePaymentId, amountEur, creditsTotal }) {
+  const now = nowIso();
   db.prepare(`
-    UPDATE donations
-    SET mollie_payment_id = COALESCE(mollie_payment_id, ?),
-        amount_eur = ?,
-        credits_total = ?,
-        status = 'waiting',
-        updated_at = ?
+    UPDATE donations SET
+      mollie_payment_id = COALESCE(mollie_payment_id, ?),
+      amount_eur = ?,
+      credits_total = ?,
+      status = 'waiting',
+      created_at = ?,       -- payment time defines queue order
+      updated_at = ?
     WHERE intent_id = ?
-  `).run(molliePaymentId, amountEur, creditsTotal, nowIso(), intentId);
+  `).run(molliePaymentId, amountEur, creditsTotal, now, now, intentId);
 }
 
 function setDonationStatus(id, status) {

@@ -48,6 +48,28 @@ app.use(express.json());
 const mollie = createMollieClient({ apiKey: process.env.MOLLIE_API_KEY });
 
 /**
+ * Hold safety watchdog:
+ * - On weak networks or iOS Safari, "release" packets can be dropped.
+ * - If a release does NOT arrive within MAX_HOLD_MS, auto-release server-side.
+ * - This prevents stuck claw movement.
+ */
+const MAX_HOLD_MS = 1200;
+const holdTimers = new Map();
+
+function armAutoRelease(direction) {
+    if (holdTimers.has(direction)) {
+        clearTimeout(holdTimers.get(direction));
+    }
+
+    const t = setTimeout(() => {
+        gpio.release(direction);
+        holdTimers.delete(direction);
+    }, MAX_HOLD_MS);
+
+    holdTimers.set(direction, t);
+}
+
+/**
  * Create a Mollie payment (Intent-first)
  * Body: { name, amountEuros, email? }
  */
@@ -124,7 +146,6 @@ app.post('/api/mollie/webhook', async (req, res) => {
             });
         }
 
-
         return res.status(200).send('ok');
     } catch (err) {
         console.error('Webhook error:', err);
@@ -161,7 +182,6 @@ app.post('/api/play/claim', async (req, res) => {
 
                 donation = getIntent(intentId);
             }
-
         }
 
         if (donation.status === 'created') {
@@ -185,6 +205,15 @@ app.post('/api/play/claim', async (req, res) => {
  * Queue state for UI (+ active state for refresh sync)
  */
 app.get('/api/queue', (req, res) => {
+    // Hard-disable caching at browser/CDN/proxy level
+    res.set('Cache-Control', 'no-store, no-cache, must-revalidate, proxy-revalidate');
+    res.set('Pragma', 'no-cache');
+    res.set('Expires', '0');
+    res.set('Surrogate-Control', 'no-store');
+
+    // Ensure the queue starts even if a webhook was delayed/missed
+    game.maybeStartNext();
+
     const queue = listQueue().map((d, idx) => ({
         id: d.id,
         name: d.name,
@@ -194,13 +223,8 @@ app.get('/api/queue', (req, res) => {
     }));
 
     const activeState = game.getActiveState();
-
-    return res.json({
-        queue,
-        ...activeState,
-    });
+    return res.json({ queue, ...activeState });
 });
-
 
 /**
  * Control press (hold direction)
@@ -220,11 +244,15 @@ app.post('/api/control/press', (req, res) => {
 
     // Timer starts on first movement
     game.startCreditTimerIfNeeded();
+
+    // Start holding the direction
     gpio.hold(direction);
+
+    // Safety watchdog: auto-release if release packet is lost
+    armAutoRelease(direction);
 
     return res.json({ ok: true });
 });
-
 
 /**
  * Control release (stop hold)
@@ -242,10 +270,15 @@ app.post('/api/control/release', (req, res) => {
         return res.status(400).json({ error: 'invalid_direction' });
     }
 
+    // Cancel watchdog timer for this direction
+    if (holdTimers.has(direction)) {
+        clearTimeout(holdTimers.get(direction));
+        holdTimers.delete(direction);
+    }
+
     gpio.release(direction);
     return res.json({ ok: true });
 });
-
 
 /**
  * Grab = one per credit, ends credit early
@@ -273,6 +306,12 @@ app.post('/api/control/grab', (req, res) => {
  * Query: ?token=xxx
  */
 app.get('/api/me', (req, res) => {
+    // Hard-disable caching for player state too
+    res.set('Cache-Control', 'no-store, no-cache, must-revalidate, proxy-revalidate');
+    res.set('Pragma', 'no-cache');
+    res.set('Expires', '0');
+    res.set('Surrogate-Control', 'no-store');
+
     const token = req.query.token;
     if (!token) return res.status(400).json({ error: 'token required' });
 
@@ -290,7 +329,6 @@ app.get('/api/me', (req, res) => {
         creditsRemaining,
     });
 });
-
 
 const PORT = process.env.PORT || 4000;
 app.listen(PORT, () => {
