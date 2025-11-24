@@ -2,8 +2,8 @@ const { spawn, execSync } = require("child_process");
 
 // BCM pins used
 const pins = {
-    up: 27,
-    down: 22,
+    up: 22,
+    down: 27,
     left: 23,
     right: 24,
     grab: 17,

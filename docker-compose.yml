@@ -15,6 +15,7 @@ services:
       - MOLLIE_API_KEY=${MOLLIE_API_KEY}
       - PUBLIC_WEB_URL=${PUBLIC_WEB_URL}
       - PUBLIC_API_URL=${PUBLIC_API_URL}
+      - ADMIN_TOKEN=${ADMIN_TOKEN}
     volumes:
       - ./api:/usr/src/app
       - sweetpi_core_node_modules:/usr/src/app/node_modules
