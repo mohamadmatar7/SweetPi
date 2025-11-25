@@ -196,15 +196,20 @@ function scheduleFirstMoveTimeout() {
         );
 
         if (someoneWaiting) {
-            requeueToEnd(active.donationId);
+            // Player did not move within the first-move window
+            // while someone else is already waiting.
+            // Instead of pushing them to the back of the queue,
+            // we end their session to avoid "stuck queue" and
+            // weird requeue behaviour.
+            const timedOutDonationId = active.donationId;
+
+            endActivePlayer(); // sets status = 'done' and starts next player
+
             safeTrigger('public-chat', 'player-timeout', {
-                donationId: active.donationId,
+                donationId: timedOutDonationId,
                 reason: 'no_first_move',
             });
 
-            active = null;
-            broadcastQueue();
-            maybeStartNext();
             return;
         }
 
