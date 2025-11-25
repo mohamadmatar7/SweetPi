@@ -24,7 +24,7 @@ db.exec(`
     amount_eur REAL,                    -- set when paid
     credits_total INTEGER NOT NULL DEFAULT 0,
     credits_used INTEGER NOT NULL DEFAULT 0,
-    credits_pulsed INTEGER NOT NULL DEFAULT 0, -- ✅ credits pressed on machine once
+    credits_pulsed INTEGER NOT NULL DEFAULT 0, -- credits pressed on machine once
     status TEXT NOT NULL DEFAULT 'created',    -- created | waiting | active | done
     session_token TEXT,
     created_at TEXT NOT NULL,
@@ -52,7 +52,7 @@ ensureColumn('amount_requested_eur', 'REAL NOT NULL DEFAULT 0');
 ensureColumn('amount_eur', 'REAL');
 ensureColumn('credits_total', 'INTEGER NOT NULL DEFAULT 0');
 ensureColumn('credits_used', 'INTEGER NOT NULL DEFAULT 0');
-ensureColumn('credits_pulsed', 'INTEGER NOT NULL DEFAULT 0'); // ✅ NEW
+ensureColumn('credits_pulsed', 'INTEGER NOT NULL DEFAULT 0');
 ensureColumn('status', "TEXT NOT NULL DEFAULT 'created'");
 ensureColumn('session_token', 'TEXT');
 ensureColumn('created_at', "TEXT NOT NULL DEFAULT ''");
@@ -114,6 +114,10 @@ function getIntent(intentId) {
   return db.prepare(`SELECT * FROM donations WHERE intent_id = ?`).get(intentId);
 }
 
+function getDonationById(id) {
+  return db.prepare(`SELECT * FROM donations WHERE id = ?`).get(id);
+}
+
 function getDonationByPaymentId(molliePaymentId) {
   return db.prepare(`SELECT * FROM donations WHERE mollie_payment_id = ?`).get(molliePaymentId);
 }
@@ -170,10 +174,16 @@ function markCreditsPulsed(id) {
 function useOneCredit(id) {
   db.prepare(`
     UPDATE donations
-    SET credits_used = credits_used + 1, updated_at = ?
+    SET credits_used =
+      CASE
+        WHEN credits_used + 1 > credits_total THEN credits_total
+        ELSE credits_used + 1
+      END,
+      updated_at = ?
     WHERE id = ?
   `).run(nowIso(), id);
 }
+
 
 function getDonationByToken(token) {
   return db.prepare(`SELECT * FROM donations WHERE session_token = ?`).get(token);
@@ -188,11 +198,94 @@ function listQueue() {
   `).all();
 }
 
+/**
+ * Admin: full list for dashboard.
+ */
+function listAllDonations() {
+  return db.prepare(`
+    SELECT *
+    FROM donations
+    ORDER BY created_at DESC
+  `).all();
+}
+
+/**
+ * Admin: add/subtract credits safely.
+ * - credits_total is clamped to >= credits_used and >= 0.
+ */
+function adjustCredits(id, delta) {
+  const row = getDonationById(id);
+  if (!row) return null;
+
+  const nextTotal = Math.max(0, (row.credits_total || 0) + delta);
+  const clampedTotal = Math.max(nextTotal, row.credits_used || 0);
+
+  db.prepare(`
+    UPDATE donations
+    SET credits_total = ?, updated_at = ?
+    WHERE id = ?
+  `).run(clampedTotal, nowIso(), id);
+
+  return getDonationById(id);
+}
+
+/**
+ * Admin: set total credits safely.
+ */
+function setCreditsTotal(id, creditsTotal) {
+  const row = getDonationById(id);
+  if (!row) return null;
+
+  const nextTotal = Math.max(0, creditsTotal);
+  const clampedTotal = Math.max(nextTotal, row.credits_used || 0);
+
+  db.prepare(`
+    UPDATE donations
+    SET credits_total = ?, updated_at = ?
+    WHERE id = ?
+  `).run(clampedTotal, nowIso(), id);
+
+  return getDonationById(id);
+}
+
+/**
+ * Admin: set used credits safely.
+ */
+function setCreditsUsed(id, creditsUsed) {
+  const row = getDonationById(id);
+  if (!row) return null;
+
+  const nextUsed = Math.max(0, Math.min(creditsUsed, row.credits_total || 0));
+
+  db.prepare(`
+    UPDATE donations
+    SET credits_used = ?, updated_at = ?
+    WHERE id = ?
+  `).run(nextUsed, nowIso(), id);
+
+  return getDonationById(id);
+}
+
+/**
+ * Admin: delete a single donation row.
+ */
+function deleteDonationById(id) {
+  db.prepare(`DELETE FROM donations WHERE id = ?`).run(id);
+}
+
+/**
+ * Admin: delete all donations.
+ */
+function deleteAllDonations() {
+  db.prepare(`DELETE FROM donations`).run();
+}
+
 module.exports = {
   db,
   createIntent,
   attachPaymentToIntent,
   getIntent,
+  getDonationById,
   getDonationByPaymentId,
   markIntentPaid,
   setDonationStatus,
@@ -201,4 +294,12 @@ module.exports = {
   useOneCredit,
   getDonationByToken,
   listQueue,
+
+  // Admin exports
+  listAllDonations,
+  adjustCredits,
+  setCreditsTotal,
+  setCreditsUsed,
+  deleteDonationById,
+  deleteAllDonations,
 };

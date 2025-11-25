@@ -3,6 +3,7 @@ const cors = require('cors');
 const { createMollieClient } = require('@mollie/api-client');
 const gpio = require('./gpio');
 const game = require('./game');
+const createAdminRouter = require('./admin');
 
 const {
     createIntent,
@@ -11,9 +12,14 @@ const {
     getDonationByPaymentId,
     getDonationByToken,
     listQueue,
+
 } = require('./db');
 
 const app = express();
+
+// Disable ETag to avoid any 304/stale behavior on strange proxies/browsers
+// app.set('etag', false);
+
 
 /**
  * CORS (production-safe)
@@ -33,8 +39,8 @@ const corsOptions = {
         if (allowedOrigins.includes(origin)) return cb(null, true);
         return cb(new Error(`CORS blocked for origin: ${origin}`), false);
     },
-    methods: ['GET', 'POST', 'OPTIONS'],
-    allowedHeaders: ['Content-Type'],
+    methods: ['GET', 'POST', 'OPTIONS', 'DELETE'],
+    allowedHeaders: ['Content-Type', 'Authorization', 'x-admin-token'],
     credentials: false,
 };
 
@@ -188,6 +194,13 @@ app.post('/api/play/claim', async (req, res) => {
             return res.status(202).json({ ok: false, status: 'pending' });
         }
 
+        // ✅ Ensure queue is started even if webhook was late or nodemon restarted.
+        game.maybeStartNext();
+        game.broadcastQueue();
+
+        // Re-read so status/credits are fresh after maybeStartNext()
+        donation = getIntent(intentId);
+
         const creditsRemaining = donation.credits_total - donation.credits_used;
 
         return res.json({
@@ -195,6 +208,7 @@ app.post('/api/play/claim', async (req, res) => {
             token: donation.session_token,
             creditsRemaining,
         });
+
     } catch (err) {
         console.error('Claim error:', err);
         return res.status(500).json({ error: 'claim_failed' });
@@ -329,6 +343,10 @@ app.get('/api/me', (req, res) => {
         creditsRemaining,
     });
 });
+
+
+app.use('/api/admin', createAdminRouter(game));
+
 
 const PORT = process.env.PORT || 4000;
 app.listen(PORT, () => {

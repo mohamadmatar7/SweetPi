@@ -20,12 +20,30 @@ const pusher = new Pusher({
     useTLS: false,
 });
 
-const CREDIT_MS = 35 * 1000;       // 35s per credit
-const FIRST_MOVE_MS = 15 * 1000;  // must move within 15s if others are waiting
-const GRAB_FINISH_MS = 7 * 1000;  // after grab, wait 7s then end credit
+/**
+ * Safe trigger:
+ * - Never crash the server if Soketi is down or restarting.
+ * - Just log the error and continue game logic.
+ */
+function safeTrigger(channel, event, data) {
+    try {
+        const maybePromise = pusher.trigger(channel, event, data);
+        if (maybePromise && typeof maybePromise.catch === 'function') {
+            maybePromise.catch((err) => {
+                console.error('Pusher trigger failed:', err?.message || err);
+            });
+        }
+    } catch (err) {
+        console.error('Pusher trigger threw:', err?.message || err);
+    }
+}
+
+const CREDIT_MS = 35 * 1000;     // 35s per credit
+const FIRST_MOVE_MS = 15 * 1000; // must move within 15s if others are waiting
+const GRAB_FINISH_MS = 7 * 1000; // after grab, wait 7s then end credit
 
 let active = null;
-// {
+// active = {
 //   donationId,
 //   creditsRemaining,
 //   timer,
@@ -34,13 +52,15 @@ let active = null;
 //   firstMoveDeadline,
 //   firstMoveTimer,
 //   hasMoved,
-//   grabUsed
-// }
+//   grabUsed,
+//   creditSeq,        // increments per credit to invalidate stale timers
+//   creditConsumed,   // ensures one DB consume per credit
+// };
 
 /**
  * Boot recovery:
  * - If server restarts while someone was active, DB still says active.
- *   We move them back to waiting to avoid "ghost active" blocking queue.
+ *   Move them back to waiting to avoid a "ghost active" blocking queue.
  * - Also mark waiting rows with 0 credits as done.
  */
 function recoverAfterRestart() {
@@ -51,9 +71,9 @@ function recoverAfterRestart() {
         }
 
         const waitings = db.prepare(`
-            SELECT id, credits_total, credits_used
-            FROM donations
-            WHERE status = 'waiting'
+          SELECT id, credits_total, credits_used
+          FROM donations
+          WHERE status = 'waiting'
         `).all();
 
         for (const w of waitings) {
@@ -80,7 +100,7 @@ function broadcastQueue() {
         position: idx + 1,
     }));
 
-    pusher.trigger('public-chat', 'queue-update', {
+    safeTrigger('public-chat', 'queue-update', {
         activeDonationId: active?.donationId || null,
         creditEndsAt: active?.creditEndsAt || null,
         firstMoveDeadline: active?.firstMoveDeadline || null,
@@ -114,6 +134,12 @@ function maybeStartNext() {
 
     const creditsRemaining = next.credits_total - next.credits_used;
 
+    // Safety: never activate a player with 0 or negative credits
+    if (creditsRemaining <= 0) {
+        setDonationStatus(next.id, 'done');
+        return maybeStartNext();
+    }
+
     active = {
         donationId: next.id,
         creditsRemaining,
@@ -124,6 +150,8 @@ function maybeStartNext() {
         firstMoveTimer: null,
         hasMoved: false,
         grabUsed: false,
+        creditSeq: 0,
+        creditConsumed: false,
     };
 
     setDonationStatus(next.id, 'active');
@@ -139,7 +167,7 @@ function maybeStartNext() {
     scheduleFirstMoveTimeout();
     broadcastQueue();
 
-    pusher.trigger('public-chat', 'player-start', {
+    safeTrigger('public-chat', 'player-start', {
         donationId: next.id,
         name: next.name,
         creditsRemaining,
@@ -169,8 +197,7 @@ function scheduleFirstMoveTimeout() {
 
         if (someoneWaiting) {
             requeueToEnd(active.donationId);
-
-            pusher.trigger('public-chat', 'player-timeout', {
+            safeTrigger('public-chat', 'player-timeout', {
                 donationId: active.donationId,
                 reason: 'no_first_move',
             });
@@ -203,14 +230,35 @@ function startCreditTimerIfNeeded() {
     active.timerStarted = true;
     active.creditEndsAt = Date.now() + CREDIT_MS;
 
-    pusher.trigger('public-chat', 'credit-start', {
+    // New credit cycle => bump sequence and reset consume flag
+    active.creditSeq += 1;
+    const mySeq = active.creditSeq;
+    active.creditConsumed = false;
+
+    safeTrigger('public-chat', 'credit-start', {
         donationId: active.donationId,
         creditEndsAt: active.creditEndsAt,
         creditsRemaining: active.creditsRemaining,
     });
 
-    // Normal credit timeout
-    active.timer = setTimeout(finishCreditNormally, CREDIT_MS);
+    active.timer = setTimeout(() => {
+        if (!active || active.creditSeq !== mySeq) return;
+        finishCreditNormally();
+    }, CREDIT_MS);
+}
+
+/**
+ * Consume one credit safely (idempotent per credit).
+ */
+function consumeOneCreditSafely() {
+    if (!active) return false;
+    if (active.creditConsumed) return false;
+
+    active.creditConsumed = true;
+    useOneCredit(active.donationId);
+    active.creditsRemaining -= 1;
+
+    return true;
 }
 
 /**
@@ -219,11 +267,10 @@ function startCreditTimerIfNeeded() {
 function finishCreditNormally() {
     if (!active) return;
 
-    useOneCredit(active.donationId);
-    active.creditsRemaining -= 1;
+    const consumed = consumeOneCreditSafely();
+    if (!consumed) return;
 
     if (active.creditsRemaining > 0) {
-        // Prepare next credit
         active.timerStarted = false;
         active.creditEndsAt = null;
         active.hasMoved = false;
@@ -240,47 +287,44 @@ function finishCreditNormally() {
 /**
  * Grab handler:
  * - Only one grab per credit.
- * - After grab, shorten remaining time to GRAB_FINISH_MS,
- *   then end the credit automatically.
+ * - After grab, shorten remaining time to GRAB_FINISH_MS.
  */
 function handleGrabIfAllowed() {
     if (!active) return { ok: false, error: 'no_active' };
     if (active.grabUsed) return { ok: false, error: 'grab_already_used' };
 
-    // If timer not started yet, this counts as first move
     if (!active.timerStarted) {
-        startCreditTimerIfNeeded(); // starts 35s timer & cancels first-move timeout
+        startCreditTimerIfNeeded();
     }
 
-    // Override current credit timer to end after grab finish
     if (active.timer) clearTimeout(active.timer);
 
     active.grabUsed = true;
     active.creditEndsAt = Date.now() + GRAB_FINISH_MS;
 
-    // Tell frontend to sync timer to 7s
-    pusher.trigger('public-chat', 'credit-start', {
+    active.creditSeq += 1;
+    const mySeq = active.creditSeq;
+    active.creditConsumed = false;
+
+    safeTrigger('public-chat', 'credit-start', {
         donationId: active.donationId,
         creditEndsAt: active.creditEndsAt,
         creditsRemaining: active.creditsRemaining,
     });
 
-    // Pulse grab on machine
     gpio.pulse('grab', 300);
 
-    // End credit after claw finishes movement
     active.timer = setTimeout(() => {
-        if (!active) return;
+        if (!active || active.creditSeq !== mySeq) return;
 
-        useOneCredit(active.donationId);
-        active.creditsRemaining -= 1;
+        const consumed = consumeOneCreditSafely();
+        if (!consumed) return;
 
         if (active.creditsRemaining > 0) {
             active.timerStarted = false;
             active.creditEndsAt = null;
             active.hasMoved = false;
             active.grabUsed = false;
-
             scheduleFirstMoveTimeout();
         } else {
             endActivePlayer();
@@ -302,9 +346,11 @@ function endActivePlayer() {
     if (active.firstMoveTimer) clearTimeout(active.firstMoveTimer);
 
     gpio.releaseAll();
-
     setDonationStatus(active.donationId, 'done');
-    pusher.trigger('public-chat', 'player-end', { donationId: active.donationId });
+
+    safeTrigger('public-chat', 'player-end', {
+        donationId: active.donationId,
+    });
 
     active = null;
     maybeStartNext();
@@ -346,6 +392,29 @@ function handlePaidDonation({ intentId, molliePaymentId, amountEur }) {
 
     return { creditsTotal };
 }
+
+/**
+ * Realtime heartbeat:
+ * - Fixes first-player late-join issue (missed initial events).
+ * - Only broadcasts current snapshot periodically.
+ * - Does NOT change game logic or DB state.
+ */
+const HEARTBEAT_MS = 4000;
+
+setInterval(() => {
+    try {
+        const q = listQueue();
+        const hasState =
+            !!active || q.some(d => d.status === 'waiting' || d.status === 'active');
+
+        if (hasState) {
+            broadcastQueue();
+        }
+    } catch (err) {
+        console.error('Realtime heartbeat error:', err);
+    }
+}, HEARTBEAT_MS);
+
 
 module.exports = {
     handlePaidDonation,
